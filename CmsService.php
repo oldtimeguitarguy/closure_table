@@ -1,267 +1,179 @@
 <?php
 
-namespace App\Services;
+namespace Brandmovers\Catalog\Models;
 
-use stdClass;
-use App\Exceptions\CmsException;
-use Illuminate\Support\Collection;
-use Illuminate\Database\ConnectionInterface;
+use DB;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations;
+use Illuminate\Database\Eloquent\Collection;
 
-// TODO(kjh): I NEED TO MAKE SURE THIS ALWAYS HAS A REAL ROOT
-
-/**
- * The CMS uses a combination of the Closure Table & the Path Enumeration methods
- * for storing and interacting with a tree of data.
- * More information here: https://www.slideshare.net/billkarwin/models-for-hierarchical-data
- * A video here: https://www.youtube.com/watch?v=wuH5OoPC3hA
- */
-class CmsService
+class CatalogCategory extends Model
 {
-    private $db;
+    public $timestamps = false;
+    protected $fillable = ['name'];
 
-    public function __construct(ConnectionInterface $db)
+    //----- PUBLIC STATIC METHODS ----------------------// 
+
+    /** Get all of the tree roots */
+    public static function getRoot() : CatalogCategory
     {
-        $this->db = $db;
-    }
-
-
-    //----- PUBLIC METHODS -----------------------------// 
-
-    /** Get the path map of values from the given root path */
-    public function getPathMap(string $root) : array
-    {
-        $query = $this->db->table('cms_data')
-            ->select('cms_data.path as path', 'cms_data.value as value')
-            ->join('cms_closure', 'cms_data.id', '=', 'cms_closure.descendant_id')
-            ->whereNotNull('cms_data.value')
-            ->orderBy('cms_closure.length', 'asc');
-
-        $rootLength = 1;
-        $root = '/'.str_nopreslash($root);
-
-        if ($root === '/') {
-            $query->where('cms_closure.ancestor_id', 0);
-        } else {
-            $rootLength += strlen($root);
-            $query->where('cms_closure.ancestor_id', function ($query) use ($root) {
-                $query->select('id')->from('cms_data')->where('path', $root)->limit(1);
-            });
-        }
-        
-        return $query->get()->mapWithKeys(function ($leaf) use ($rootLength) {
-            return [ substr($leaf->path, $rootLength) => $leaf->value ];
-        })->all();
-    }
-
-    /** Get the value from the given path */
-    public function getValueFromPath(string $path) : string
-    {
-        // Search for the normalized path
-        $path = str_nopreslash($path);
-        $leaf = $this->db->table('cms_data')
-            ->where('path', "/{$path}")->first(['value']);
-
-        // Make sure it exists
-        if (is_null($leaf)) {
-            throw new CmsException("Entry with path '{$path}' not found.", 404);
-        }
-
-        // Make sure it's not a parent leaf
-        if (is_null($leaf->value)) {
-            throw new CmsException("Entry with path '{$path}' has no value.", 403);
-        }
-
-        // Return the value
-        return $leaf->value;
+        return static::find(1);
     }
 
     /**
-     * Set a value on a given path
-     *
-     * 1. If the path is empty, then assume root & set key/value. Easy.
-     * 2. If the key exists on the given path, then delete its descendants & set the value.
-     * 3. Working backwards, search each path depth until found (or not found).
-     * 4. Construct the tree from there, finally setting the value at the end.
-     * 5. Return the id of the inserted leaf
+     * Import an array of categories, building the lineage
+     * as necessary from 0 -> n. Then return the final
+     * leaf in the lineage.
      */
-    public function setValueOnPath(string $path, string $value) : int
+    public static function import(array $categories) : CatalogCategory
     {
-        return $this->db->transaction(function () use ($path, $value) {
-            // Explode the normalized path & pop the last element as the key
-            $existingKeys = explode('/', str_nopreslash($path));
-            $key = array_pop($existingKeys);
+        // Get the root category
+        $parent = static::getRoot();
 
-            if (is_null($key)) {
-                throw new CmsException('Values cannot be set directly on the root.', 403);
-            }
+        // Loop through each category name in the name list
+        foreach ($categories as $category) {
+            // Get the matching category from the children
+            $match = $parent->getChildren()
+                ->first(function (CatalogCategory $possibleMatch) use ($category) {
+                    return $possibleMatch->name === $category->name;
+                });
 
-            /* 1. If the path is empty, then assume root & set key/value. Easy. */
-            if (empty($existingKeys)) {
-                return $this->insertChild(0, $key, $value);
-            }
+            // If there is no match, then create it.
+            // Replace $parent with the new value
+            $parent = $match ?: $parent->insertChild($category);
+        }
 
-            /* 2. If the key exists on the given path, then delete its descendants & set the value. */
-            $leaf = $this->db->table('cms_data')
-                ->where('path', '/'.implode('/', $existingKeys).'/'.$key)->first(['id']);
+        // Return the final category
+        return $parent;
+    }
 
-            if (! is_null($leaf)) {
-                $this->deleteSubtree($leaf->id);
-                return $this->setValueOnPath($path, $value);
-            }
+    /** Get this catalog category and its descendants */
+    public static function getDescendants(array $parentIds, array $attributes = ['*']) : Collection
+    {
+        return static::query()
+            ->join('catalog_categories_closure', 'catalog_categories.id', '=', 'catalog_categories_closure.descendant_id')
+            ->whereIn('catalog_categories_closure.ancestor_id', $parentIds)
+            ->groupBy(['catalog_categories.id', 'catalog_categories_closure.ancestor_id', 'catalog_categories_closure.length'])
+            ->orderBy('catalog_categories_closure.length', 'asc')
+            ->get($attributes);
+    }
 
-            /* 3. Working backwards, search each path depth until found (or not found). */
-            $newKeys = [];
-            do {
-                // Remove and save the last key
-                $newKeys[] = array_pop($existingKeys);
+    /** Get the immediate children of this catalog category */
+    public static function getChildren(array $parentIds, array $attributes = ['*']) : Collection
+    {
+        return static::query()
+            ->join('catalog_categories_closure', 'catalog_categories.id', '=', 'catalog_categories_closure.descendant_id')
+            ->whereIn('catalog_categories_closure.ancestor_id', $parentIds)
+            ->where('catalog_categories_closure.length', 1)
+            ->groupBy(['catalog_categories.id', 'catalog_categories_closure.ancestor_id', 'catalog_categories_closure.length'])
+            ->orderBy('catalog_categories_closure.length', 'asc')
+            ->get($attributes);
+    }
 
-                // Get the new shorter path
-                $path = implode('/', $existingKeys);
+    /** Get this catalog category and its ancestors */
+    public static function getAncestors(array $parentIds, array $attributes = ['*']) : Collection
+    {
+        return static::query()
+            ->join('catalog_categories_closure', 'catalog_categories.id', '=', 'catalog_categories_closure.ancestor_id')
+            ->whereIn('catalog_categories_closure.descendant_id', $parentIds)
+            ->groupBy(['catalog_categories.id', 'catalog_categories_closure.ancestor_id', 'catalog_categories_closure.length'])
+            ->orderBy('catalog_categories_closure.length', 'desc')
+            ->get($attributes);
+    }
 
-                // If this path exists, then we can break
-                $leaf = $this->db->table('cms_data')
-                    ->where('path', "/{$path}")->first(['id']);
+    /** Get the immediate parent of this catalog category */
+    public static function getParent(array $parentIds, array $attributes = ['*']) : CatalogCategory
+    {
+        return static::query()
+            ->join('catalog_categories_closure', 'catalog_categories.id', '=', 'catalog_categories_closure.ancestor_id')
+            ->where('catalog_categories_closure.descendant_id', $parentIds)
+            ->where('catalog_categories_closure.length', 1)
+            ->groupBy(['catalog_categories.id', 'catalog_categories_closure.ancestor_id', 'catalog_categories_closure.length'])
+            ->orderBy('catalog_categories_closure.length', 'desc')
+            ->first($attributes);
+    }
 
-                if (! is_null($leaf)) {
+    /** Insert a new catalog category under this catalog category */
+    public static function insertChild(int $parentId, CatalogCategory $child) : CatalogCategory
+    {
+        return DB::transaction(function () use ($parentId, $child) {
+            // Try to find a match
+            $match = null;
+            $matches = static::query()->where('name', $child->name)->get();
+            foreach ($matches as $possibleMatch) {
+                $parent = $possibleMatch->getParent();
+                if (!is_null($parent) && $parent->id === $parentId) {
+                    $match = $possibleMatch;
                     break;
                 }
-            } while (! empty($existingKeys));
+            }
 
-            // If leaf is null, just make it 0
-            $id = is_null($leaf) ? 0 : $leaf->id;
-
-            /* 4. Construct the tree from there, finally setting the value at the end. */
-            do {
-                $id = $this->insertChild($id, array_pop($newKeys));
-            } while (! empty($newKeys));
-            $id = $this->insertChild($id, $key, $value);
-
-            // Finally, return the id of the inserted leaf
-            return $id;
-        });
-    }
-
-
-    //----- PROTECTED METHODS --------------------------// 
-
-    /** Get the leaf of the given id and its descendants */
-    protected function getDescendants(int $id) : Collection
-    {
-        return $this->db->table('cms_data')
-            ->join('cms_closure', 'cms_data.id', '=', 'cms_closure.descendant_id')
-            ->where('cms_closure.ancestor_id', $id)
-            ->orderBy('cms_closure.length', 'asc')
-            ->get();
-    }
-
-    /** Get the immediate children of the given id */
-    protected function getChildren(int $id) : Collection
-    {
-        return $this->db->table('cms_data')
-            ->join('cms_closure', 'cms_data.id', '=', 'cms_closure.descendant_id')
-            ->where('cms_closure.ancestor_id', $id)
-            ->where('length', 1)
-            ->orderBy('cms_closure.length', 'asc')
-            ->get();
-    }
-
-    /** Get the leaf of the given id and its ancestors */
-    protected function getAncestors(int $id) : Collection
-    {
-        return $this->db->table('cms_data')
-            ->join('cms_closure', 'cms_data.id', '=', 'cms_closure.ancestor_id')
-            ->where('cms_closure.descendant_id', $id)
-            ->orderBy('cms_closure.length', 'desc')
-            ->get();
-    }
-
-    /** Get the immediate parent of the given id */
-    protected function getParent(int $id, $columns = ['*']) : ?stdClass
-    {
-        return $this->db->table('cms_data')
-            ->join('cms_closure', 'cms_data.id', '=', 'cms_closure.ancestor_id')
-            ->where('cms_closure.descendant_id', $id)
-            ->where('length', 1)
-            ->orderBy('cms_closure.length', 'desc')
-            ->first($columns);
-    }
-
-    /** Insert a new key/value under the given parent id */
-    protected function insertChild(int $parentId, string $key, string $value = null) : int
-    {
-        return $this->db->transaction(function () use ($parentId, $key, $value) {
-            // Get the parent path, if there is one
-            $parentPath = $parentId === 0
-                ? '' : $this->db->table('cms_data')->where('id', $parentId)->first(['path'])->path;
-
-            // Store the new path
-            $path = "{$parentPath}/{$key}";
-
-            // Try to find a match first. If it exists, then return that id
-            $match = $this->db->table('cms_data')->where('path', $path)->first(['id']);
+            // If there is a match, then return it
             if (! is_null($match)) {
-                return $match->id;
+                return $match;
             }
 
-            // Insert the child & get its id
-            $childId = $this->db->table('cms_data')
-                ->insertGetId(['path' => $path, 'value' => $value]);
-
-            // If the parent id is 0, then connect it to the imaginary root
-            if ($parentId === 0) {
-                $this->db->table('cms_closure')
-                    ->insert(['ancestor_id' => 0, 'descendant_id' => $childId, 'length' => 1]);
-            }
+            // Save the child
+            $child->save();
 
             // With much complexity, insert it into the tree
-            $this->db->insert('
-                INSERT INTO cms_closure (ancestor_id, descendant_id, length)
+            DB::insert('
+                INSERT INTO catalog_categories_closure (ancestor_id, descendant_id, length)
                     SELECT ancestor_id, ?, SUM(length + 1)
-                        FROM cms_closure
+                        FROM catalog_categories_closure
                         WHERE descendant_id = ?
                         GROUP BY ancestor_id
                     UNION ALL SELECT ?, ?, 0
-            ', [$childId, $parentId, $childId, $childId, $childId]);
+            ', [$child->id, $parentId, $child->id, $child->id]);
 
-            // Return the child id
-            return $childId;
+            // Return the child
+            return $child;
         });
     }
 
-    /** Update the value of the given leaf, referenced by id */
-    protected function updateValue(int $id, string $value) : boolean
+    /** Delete the subtree under this catalog category and return the deleted ids */
+    public static function deleteSubtree(int $parentId) : Collection
     {
-        $numRowsUpdated = $this->db->table('cms_data')
-            ->where('id', $id)->update(['value', $value]);
-
-        if ($numRowsUpdated === 0) {
-            throw new CmsException("Entry with id {$id} not found. Cannot update.", 404);
-        }
-
-        return true;
-    }
-
-    /** Delete the subtree under the given id and return the deleted ids */
-    protected function deleteSubtree(int $id) : Collection
-    {
-        return $this->db->transaction(function () use ($id) {
+        return $this->db->transaction(function () use ($parentId) {
             // Get the descendant ids
-            $ids = $this->db->table('cms_closure')
-                ->where('ancestor_id', $id)
+            $ids = DB::table('catalog_categories_closure')
+                ->where('ancestor_id', $parentId)
                 ->pluck('descendant_id');
 
             // Delete them from the closure table
-            $this->db->table('cms_closure')
+            DB::table('catalog_categories_closure')
                 ->whereIn('descendant_id', $ids)
                 ->delete();
 
             // Delete them from the data table
-            $this->db->table('cms_data')
+            static::query()
                 ->whereIn('id', $ids)
                 ->delete();
 
             // Return the ids
             return $ids;
         });
+    }
+
+    //----- RELATIONSHIPS ------------------------------// 
+
+    public function items() : Relations\HasMany
+    {
+        return $this->hasMany(CatalogItem::class, 'category_id');
+    }
+
+    //----- MAGIC METHODS ------------------------------// 
+
+    /** Call the tree methods in reference to $this->id */
+    public function __call($method, $parameters)
+    {
+        $methods = ['getDescendants', 'getChildren', 'getParent', 'insertChild', 'deleteSubtree'];
+
+        if (in_array($method, $methods)) {
+            $ids = in_array($method, ['insertChild', 'deleteSubtree']) ? $this->id : [$this->id];
+            return static::$method(...array_merge([$ids], $parameters));
+        }
+
+        return parent::__call($method, $parameters);
     }
 }
